@@ -23,28 +23,11 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        goos: [linux, windows, darwin, freebsd]
-        goarch: [amd64, arm64, 386]
+        goos: [linux]
+        goarch: [loong64]
         include:
           - goos: linux
-            goarch: 386
-          - goos: linux
-            goarch: s390x
-          - goos: linux
-            goarch: riscv64
-          - goos: linux
-            goarch: arm
-          - goos: linux
-            goarch: mips
-            gomips: softfloat
-          - goos: linux
-            goarch: mipsle
-            gomips: softfloat
-          - goos: freebsd
-            goarch: arm
-        exclude:
-          - goos: darwin
-            goarch: 386
+            goarch: loong64
 
     name: Build artifacts
     runs-on: ubuntu-latest
