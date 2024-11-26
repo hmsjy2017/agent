@@ -15,11 +15,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/blang/semver"
 	"github.com/ebi-yade/altsvc-go"
-	"github.com/nezhahq/go-github-selfupdate/selfupdate"
 	"github.com/nezhahq/service"
 	ping "github.com/prometheus-community/pro-bing"
 	"github.com/quic-go/quic-go/http3"
@@ -57,6 +56,8 @@ type AgentCliParam struct {
 	IPReportPeriod        uint32 // 上报IP间隔
 	UseIPv6CountryCode    bool   // 默认优先展示IPv6旗帜
 	UseGiteeToUpgrade     bool   // 强制从Gitee获取更新
+	DisableNat            bool   // 关闭内网穿透
+	DisableSendQuery      bool   // 关闭发送TCP/ICMP/HTTP请求
 }
 
 var (
@@ -92,6 +93,8 @@ var (
 		Timeout:   time.Second * 30,
 		Transport: &http3.RoundTripper{},
 	}
+
+	hostStatus = new(atomic.Bool)
 )
 
 const (
@@ -145,6 +148,8 @@ func init() {
 	agentCmd.PersistentFlags().BoolVar(&agentCliParam.SkipConnectionCount, "skip-conn", false, "不监控连接数")
 	agentCmd.PersistentFlags().BoolVar(&agentCliParam.SkipProcsCount, "skip-procs", false, "不监控进程数")
 	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableCommandExecute, "disable-command-execute", false, "禁止在此机器上执行命令")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableNat, "disable-nat", false, "禁止此机器内网穿透")
+	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableSendQuery, "disable-send-query", false, "禁止此机器发送TCP/ICMP/HTTP请求")
 	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableAutoUpdate, "disable-auto-update", false, "禁用自动升级")
 	agentCmd.PersistentFlags().BoolVar(&agentCliParam.DisableForceUpdate, "disable-force-update", false, "禁用强制升级")
 	agentCmd.PersistentFlags().BoolVar(&agentCliParam.UseIPv6CountryCode, "use-ipv6-countrycode", false, "使用IPv6的位置上报")
@@ -227,14 +232,14 @@ func run() {
 	go monitor.UpdateIP(agentCliParam.UseIPv6CountryCode, agentCliParam.IPReportPeriod)
 
 	// 定时检查更新
-	if _, err := semver.Parse(version); err == nil && !agentCliParam.DisableAutoUpdate {
-		doSelfUpdate(true)
-		go func() {
-			for range time.Tick(20 * time.Minute) {
-				doSelfUpdate(true)
-			}
-		}()
-	}
+	// if _, err := semver.Parse(version); err == nil && !agentCliParam.DisableAutoUpdate {
+	// 	doSelfUpdate(true)
+	// 	go func() {
+	// 		for range time.Tick(20 * time.Minute) {
+	// 			doSelfUpdate(true)
+	// 		}
+	// 	}()
+	// }
 
 	var err error
 	var conn *grpc.ClientConn
@@ -383,8 +388,8 @@ func doTask(task *pb.Task) {
 		handleTcpPingTask(task, &result)
 	case model.TaskTypeCommand:
 		handleCommandTask(task, &result)
-	case model.TaskTypeUpgrade:
-		handleUpgradeTask(task, &result)
+	// case model.TaskTypeUpgrade:
+	// 	handleUpgradeTask(task, &result)
 	case model.TaskTypeTerminalGRPC:
 		handleTerminalTask(task)
 		return
@@ -392,7 +397,7 @@ func doTask(task *pb.Task) {
 		handleNATTask(task)
 		return
 	case model.TaskTypeReportHostInfo:
-		reportState(time.Time{})
+		reportHost()
 		return
 	case model.TaskTypeFM:
 		handleFMTask(task)
@@ -430,51 +435,70 @@ func reportState(lastReportHostInfo time.Time) time.Time {
 		}
 		// 每10分钟重新获取一次硬件信息
 		if lastReportHostInfo.Before(time.Now().Add(-10 * time.Minute)) {
-			lastReportHostInfo = time.Now()
-			client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
-			if monitor.GeoQueryIP != "" {
-				geoip, err := client.LookupGeoIP(context.Background(), &pb.GeoIP{Ip: monitor.GeoQueryIP})
-				if err == nil {
-					monitor.CachedCountryCode = geoip.GetCountryCode()
-				}
+			if reportHost() {
+				lastReportHostInfo = time.Now()
 			}
 		}
 	}
 	return lastReportHostInfo
 }
 
-// doSelfUpdate 执行更新检查 如果更新成功则会结束进程
-func doSelfUpdate(useLocalVersion bool) {
-	v := semver.MustParse("0.1.0")
-	if useLocalVersion {
-		v = semver.MustParse(version)
+func reportHost() bool {
+	if !hostStatus.CompareAndSwap(false, true) {
+		return false
 	}
-	printf("检查更新: %v", v)
-	var latest *selfupdate.Release
-	var err error
-	if monitor.CachedCountryCode != "cn" && !agentCliParam.UseGiteeToUpgrade {
-		latest, err = selfupdate.UpdateSelf(v, "nezhahq/agent")
-	} else {
-		latest, err = selfupdate.UpdateSelfGitee(v, "naibahq/agent")
+	defer hostStatus.Store(false)
+
+	if client != nil && initialized {
+		client.ReportSystemInfo(context.Background(), monitor.GetHost().PB())
+		if monitor.GeoQueryIP != "" {
+			geoip, err := client.LookupGeoIP(context.Background(), &pb.GeoIP{Ip: monitor.GeoQueryIP})
+			if err == nil {
+				monitor.CachedCountryCode = geoip.GetCountryCode()
+			}
+		}
 	}
-	if err != nil {
-		printf("更新失败: %v", err)
-		return
-	}
-	if !latest.Version.Equals(v) {
-		printf("已经更新至: %v, 正在结束进程", latest.Version)
-		os.Exit(1)
-	}
+
+	return true
 }
 
-func handleUpgradeTask(*pb.Task, *pb.TaskResult) {
-	if agentCliParam.DisableForceUpdate {
-		return
-	}
-	doSelfUpdate(false)
-}
+// // doSelfUpdate 执行更新检查 如果更新成功则会结束进程
+// func doSelfUpdate(useLocalVersion bool) {
+// 	v := semver.MustParse("0.1.0")
+// 	if useLocalVersion {
+// 		v = semver.MustParse(version)
+// 	}
+// 	printf("检查更新: %v", v)
+// 	var latest *selfupdate.Release
+// 	var err error
+// 	if monitor.CachedCountryCode != "cn" && !agentCliParam.UseGiteeToUpgrade {
+// 		latest, err = selfupdate.UpdateSelf(v, "nezhahq/agent")
+// 	} else {
+// 		latest, err = selfupdate.UpdateSelfGitee(v, "naibahq/agent")
+// 	}
+// 	if err != nil {
+// 		printf("更新失败: %v", err)
+// 		return
+// 	}
+// 	if !latest.Version.Equals(v) {
+// 		printf("已经更新至: %v, 正在结束进程", latest.Version)
+// 		os.Exit(1)
+// 	}
+// }
+
+// func handleUpgradeTask(*pb.Task, *pb.TaskResult) {
+// 	if agentCliParam.DisableForceUpdate {
+// 		return
+// 	}
+// 	doSelfUpdate(false)
+// }
 
 func handleTcpPingTask(task *pb.Task, result *pb.TaskResult) {
+	if agentCliParam.DisableSendQuery {
+		result.Data = "此 Agent 已禁止发送请求"
+		return
+	}
+
 	host, port, err := net.SplitHostPort(task.GetData())
 	if err != nil {
 		result.Data = err.Error()
@@ -501,6 +525,11 @@ func handleTcpPingTask(task *pb.Task, result *pb.TaskResult) {
 }
 
 func handleIcmpPingTask(task *pb.Task, result *pb.TaskResult) {
+	if agentCliParam.DisableSendQuery {
+		result.Data = "此 Agent 已禁止发送请求"
+		return
+	}
+
 	ipAddr, err := lookupIP(task.GetData())
 	if err != nil {
 		result.Data = err.Error()
@@ -528,6 +557,11 @@ func handleIcmpPingTask(task *pb.Task, result *pb.TaskResult) {
 }
 
 func handleHttpGetTask(task *pb.Task, result *pb.TaskResult) {
+	if agentCliParam.DisableSendQuery {
+		result.Data = "此 Agent 已禁止发送请求"
+		return
+	}
+
 	start := time.Now()
 	taskUrl := task.GetData()
 	resp, err := httpClient.Get(taskUrl)
@@ -741,6 +775,11 @@ func handleTerminalTask(task *pb.Task) {
 }
 
 func handleNATTask(task *pb.Task) {
+	if agentCliParam.DisableNat {
+		println("此 Agent 已禁止内网穿透")
+		return
+	}
+
 	var nat model.TaskNAT
 	err := util.Json.Unmarshal([]byte(task.GetData()), &nat)
 	if err != nil {
