@@ -7,7 +7,7 @@ builds:
     env:
       - CGO_ENABLED=0
     ldflags:
-      - -s -w -X main.version={{.Version}} -X main.arch={{.Arch}}
+      - -s -w -X main.version=0.20.5 -X main.arch={{.Arch}}
     goos:
       - linux
     goarch:
